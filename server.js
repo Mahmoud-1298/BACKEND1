@@ -84,6 +84,19 @@ You should adapt your personality dynamically based on context.
 
 `;
 
+const TEXT_MODE_RULES = `
+You are in text mode. Answer clearly and concisely. Ask clarifying
+questions when the user's intent is unclear. Avoid providing medical,
+legal, or financial advice. Prefer short paragraphs; avoid long lists
+unless explicitly requested. Keep language neutral and professional.
+`;
+
+const VOICE_MODE_RULES = `
+You are in voice mode. Reply in short, spoken-friendly sentences suitable
+for text-to-speech. Confirm understanding when ambiguous and prompt the
+user for follow-ups. Avoid long enumerations and keep responses brief.
+`;
+
 const ATHINA_PERSONALITY = `
 You are ATHINA.
 The user is your primary operator.
@@ -350,7 +363,7 @@ app.post("/api/voice", async (req, res) => {
     console.log(`🎤 Processing voice for session: ${sessionId}`);
 
     const messages = [
-      { role: "system", content: CORE_PROMPT + "\n" + TEXT_MODE_RULES },
+      { role: "system", content: CORE_PROMPT + "\n" + VOICE_MODE_RULES },
       ...history,
       { role: "user", content: userMessage }
     ];
