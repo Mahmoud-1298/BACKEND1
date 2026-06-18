@@ -351,7 +351,7 @@ app.post("/api/voice", async (req, res) => {
     // ✅ Convert response to speech using ElevenLabs
     console.log("🔊 Converting response to speech via ElevenLabs...");
     const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-    const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+    const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID || "lxYfHSkYm1EzQzGhdbfc";
 
     const ttsResponse = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
