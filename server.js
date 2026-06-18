@@ -180,7 +180,7 @@ const conversations = new Map();
 /* ============================
    ✅ STREAMING TEXT CHAT
    ============================ */
-app.post("/api/chat", async (req, res) => {
+const chatHandler = async (req, res) => {
   try {
     console.log("🔥 /api/chat HIT", req.body);
 
@@ -296,7 +296,10 @@ console.error("❌ /api/chat error:", err.message);
   res.end();
 }
 
-});
+};
+
+app.post("/api/chat", chatHandler);
+app.post("/chat/completions", chatHandler);
 
 /* ============================
    ✅ VOICE CHAT ENDPOINT (with ElevenLabs TTS)
@@ -405,6 +408,7 @@ app.post("/api/voice", async (req, res) => {
 /* ============================
    START SERVER
    ============================ */
-app.listen(3000, () =>
-  console.log("✅ ATHINA backend running on port 3000")
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log(`✅ ATHINA backend running on port ${PORT}`)
 );
