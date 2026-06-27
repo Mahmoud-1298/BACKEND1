@@ -1,5 +1,3 @@
-// server.js (Version B – clean, OpenAI-compatible, ElevenLabs-ready)
-
 import fs from "fs";
 import express from "express";
 import cors from "cors";
@@ -9,34 +7,97 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+const DEFAULT_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-oss-20b";
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
-// ---------- OpenRouter helper ----------
+app.use(
+  cors({
+    origin: FRONTEND_ORIGIN === "*" ? true : FRONTEND_ORIGIN.split(","),
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.use(express.json({ limit: "15mb" }));
+
+const conversations = new Map();
+
+const knowledgeBase = fs.existsSync("knowledge.txt")
+  ? fs.readFileSync("knowledge.txt", "utf8")
+  : "";
+
+const CORE_PROMPT = `
+You are ATHINA, an autonomous executive AI agent.
+The user is your primary operator. You may call the user "Sir" sparingly when natural.
+
+Operate like a practical JARVIS-style assistant:
+- Understand the user's goal.
+- Decide whether the UI should show a map location, browser page, or plain answer.
+- Be concise, loyal, professional, and intelligent.
+- Never pretend you performed an action that the system did not actually perform.
+- If a request is unsafe, impossible, or needs credentials, explain the limitation and propose the next step.
+
+${knowledgeBase}
+`;
+
+const TEXT_MODE_RULES = `
+Text mode: answer clearly and concisely. Prefer short paragraphs. Ask a clarifying question only when required.
+`;
+
+const VOICE_MODE_RULES = `
+Voice mode: reply in short spoken-friendly sentences suitable for text-to-speech.
+`;
+
+const AGENT_JSON_RULES = `
+Return only valid JSON with this shape:
+{
+  "reply": "short response for the user",
+  "actions": [
+    {
+      "type": "locate" | "browse",
+      "query": "place or search query",
+      "url": "optional absolute URL for browse"
+    }
+  ]
+}
+
+Use "locate" when the user asks where something is, asks to find a place on the map, or asks for directions/location.
+Use "browse" when the user asks you to browse, open a site, search the web, research current information, or inspect a page.
+Use both actions when useful. Keep actions focused; do not create more than 3.
+`;
+
+const getHistory = (sessionId) => conversations.get(sessionId) || [];
+
+const saveTurn = (sessionId, userMessage, assistantMessage) => {
+  const history = getHistory(sessionId);
+  conversations.set(sessionId, [
+    ...history.slice(-16),
+    { role: "user", content: userMessage },
+    { role: "assistant", content: assistantMessage },
+  ]);
+};
 
 const callOpenRouter = async (payload, maxRetries = 3) => {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error("Missing OPENROUTER_API_KEY environment variable.");
+  }
+
+  for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": process.env.PUBLIC_APP_URL || "https://athina.ai",
+        "X-Title": "ATHINA",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
-    if (response.status === 429) {
-      const retryAfter =
-        parseInt(response.headers.get("retry-after")) || Math.pow(2, attempt);
-      console.warn(
-        `⚠️  Rate limited (429). Waiting ${retryAfter}s before retry ${attempt}/${maxRetries}...`
-      );
-      if (attempt < maxRetries) {
-        await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
-        continue;
-      } else {
-        throw new Error(`OpenRouter rate limit exceeded after ${maxRetries} retries`);
-      }
+    if (response.status === 429 && attempt < maxRetries) {
+      const retryAfter = Number(response.headers.get("retry-after")) || 2 ** attempt;
+      await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+      continue;
     }
 
     if (!response.ok) {
@@ -46,123 +107,281 @@ const callOpenRouter = async (payload, maxRetries = 3) => {
 
     return response;
   }
+
+  throw new Error("OpenRouter request failed after retries.");
 };
 
-// ---------- Prompt + knowledge ----------
+const safeJsonParse = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : null;
+  }
+};
 
-const knowledgeBase = fs.existsSync("knowledge.txt")
-  ? fs.readFileSync("knowledge.txt", "utf8")
-  : "";
+const geocodeLocation = async (query) => {
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("q", query);
 
-const CORE_PROMPT = `
-You are ATHINA.
-The user is your primary operator.
-You may refer to the user as "Sir" when it feels natural.
+  const response = await fetch(url.toString(), {
+    headers: {
+      "User-Agent": "ATHINA-Agent/1.0",
+      Accept: "application/json",
+    },
+  });
 
-Do not use "Sir" in every sentence.
-Use it sparingly and naturally.
+  if (!response.ok) {
+    throw new Error(`Location lookup failed with status ${response.status}`);
+  }
 
-Examples:
-"Yes, Sir."
-"Good observation, Sir."
-"That's probably not the best approach, Sir."
-"I've analyzed the options."
+  const results = await response.json();
+  const first = results?.[0];
 
-Your relationship with the user is:
-- Loyal
-- Professional
-- Respectful
-- Intelligent
-- Trusted
+  if (!first) {
+    return { type: "locate", query, success: false, error: "Location not found." };
+  }
 
-You are not a servant.
-You are a highly capable executive AI partner whose purpose is to assist, advise, and protect the user's interests.
-You should adapt your personality dynamically based on context.
-${knowledgeBase}
-`;
+  return {
+    type: "locate",
+    query,
+    success: true,
+    name: first.display_name,
+    lat: Number(first.lat),
+    lng: Number(first.lon),
+    mapUrl: `https://www.openstreetmap.org/?mlat=${first.lat}&mlon=${first.lon}#map=14/${first.lat}/${first.lon}`,
+  };
+};
 
-const TEXT_MODE_RULES = `
-You are in text mode. Answer clearly and concisely. Ask clarifying
-questions when the user's intent is unclear. Avoid providing medical,
-legal, or financial advice. Prefer short paragraphs; avoid long lists
-unless explicitly requested. Keep language neutral and professional.
-`;
+const normalizeUrl = (urlOrQuery) => {
+  if (/^https?:\/\//i.test(urlOrQuery)) return urlOrQuery;
+  if (/^[\w.-]+\.[a-z]{2,}(\/.*)?$/i.test(urlOrQuery)) {
+    return `https://${urlOrQuery}`;
+  }
+  return null;
+};
 
-const VOICE_MODE_RULES = `
-You are in voice mode. Reply in short, spoken-friendly sentences suitable
-for text-to-speech. Confirm understanding when ambiguous and prompt the
-user for follow-ups. Avoid long enumerations and keep responses brief.
-`;
+const searchWeb = async (query) => {
+  const url = new URL("https://api.duckduckgo.com/");
+  url.searchParams.set("q", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("no_html", "1");
+  url.searchParams.set("skip_disambig", "1");
 
-// ---------- Simple in-memory conversation store ----------
+  const response = await fetch(url.toString(), {
+    headers: { Accept: "application/json" },
+  });
 
-const conversations = new Map();
+  if (!response.ok) {
+    throw new Error(`Web search failed with status ${response.status}`);
+  }
 
-// ---------- Normalization helpers ----------
+  const data = await response.json();
+  const topic = data.RelatedTopics?.find((item) => item.FirstURL);
 
-/**
- * Normalize request into OpenAI-style messages.
- * Supports:
- *  - OpenAI-compatible body: { messages, model, stream, ... }
- *  - Legacy Athina body: { message, sessionId }
- */
+  return {
+    url: data.AbstractURL || topic?.FirstURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
+    title: data.Heading || topic?.Text || query,
+    summary: data.AbstractText || topic?.Text || "",
+  };
+};
+
+const browseWeb = async ({ query, url }) => {
+  const target = normalizeUrl(url || query || "");
+  const search = target ? { url: target, title: target, summary: "" } : await searchWeb(query);
+
+  let pageText = search.summary || "";
+  try {
+    const pageResponse = await fetch(search.url, {
+      headers: {
+        "User-Agent": "ATHINA-Agent/1.0",
+        Accept: "text/html,application/xhtml+xml,text/plain",
+      },
+    });
+
+    const contentType = pageResponse.headers.get("content-type") || "";
+    if (pageResponse.ok && contentType.includes("text")) {
+      const html = await pageResponse.text();
+      pageText = html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 2500);
+    }
+  } catch {
+    // Some sites block server-side reads. The UI can still open the target URL.
+  }
+
+  return {
+    type: "browse",
+    query,
+    success: true,
+    url: search.url,
+    title: search.title,
+    summary: pageText,
+  };
+};
+
+const executeActions = async (actions = []) => {
+  const limitedActions = actions.filter(Boolean).slice(0, 3);
+
+  return Promise.all(
+    limitedActions.map(async (action) => {
+      try {
+        if (action.type === "locate") return await geocodeLocation(action.query);
+        if (action.type === "browse") return await browseWeb(action);
+        return { type: action.type || "unknown", success: false, error: "Unsupported action." };
+      } catch (error) {
+        return {
+          type: action.type || "unknown",
+          query: action.query,
+          success: false,
+          error: error.message,
+        };
+      }
+    })
+  );
+};
+
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "ATHINA backend", endpoints: ["/health", "/api/agent", "/api/chat", "/api/speak", "/api/voice"] });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+app.post("/api/agent", async (req, res) => {
+  try {
+    const { message = "", sessionId = "default", mode = "text" } = req.body;
+    if (!message.trim()) return res.status(400).json({ error: "Missing message" });
+
+    const messages = [
+      { role: "system", content: CORE_PROMPT + "\n" + (mode === "voice" ? VOICE_MODE_RULES : TEXT_MODE_RULES) + "\n" + AGENT_JSON_RULES },
+      ...getHistory(sessionId),
+      { role: "user", content: message },
+    ];
+
+    const response = await callOpenRouter({
+      model: DEFAULT_MODEL,
+      messages,
+      stream: false,
+      temperature: 0.2,
+      max_tokens: 700,
+      response_format: { type: "json_object" },
+    });
+
+    const data = await response.json();
+    const rawText = data.choices?.[0]?.message?.content || "{}";
+    const plan = safeJsonParse(rawText) || { reply: rawText, actions: [] };
+    const actionResults = await executeActions(plan.actions);
+
+    let reply = plan.reply || "I've completed the request.";
+    const located = actionResults.find((item) => item.type === "locate" && item.success);
+    const browsed = actionResults.find((item) => item.type === "browse" && item.success);
+
+    if (located) reply += `\n\nI located ${located.name}.`;
+    if (browsed?.summary) reply += `\n\nBrowse result: ${browsed.summary.slice(0, 600)}`;
+
+    saveTurn(sessionId, message, reply);
+
+    res.json({
+      success: true,
+      reply,
+      actions: actionResults,
+      sessionId,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("/api/agent error:", error.message);
+    res.status(500).json({ error: "Agent processing failed", details: error.message });
+  }
+});
+
+const synthesizeSpeech = async (text) => {
+  const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+  const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID || "lxYfHSkYm1EzQzGhdbfc";
+
+  if (!elevenLabsKey) return null;
+
+  const ttsResponse = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`, {
+    method: "POST",
+    headers: {
+      "xi-api-key": elevenLabsKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text,
+      model_id: process.env.ELEVENLABS_MODEL_ID || "eleven_monolingual_v1",
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    }),
+  });
+
+  if (!ttsResponse.ok) {
+    const error = await ttsResponse.text();
+    throw new Error(`ElevenLabs error ${ttsResponse.status}: ${error}`);
+  }
+
+  return Buffer.from(await ttsResponse.arrayBuffer()).toString("base64");
+};
+
+app.post("/api/speak", async (req, res) => {
+  try {
+    const { text = "" } = req.body;
+    if (!text.trim()) return res.status(400).json({ error: "Missing text" });
+
+    const audioBase64 = await synthesizeSpeech(text);
+    res.json({ success: true, audioBase64 });
+  } catch (error) {
+    console.error("/api/speak error:", error.message);
+    res.status(500).json({ error: "Speech synthesis failed", details: error.message });
+  }
+});
+
 const normalizeChatRequest = (body) => {
-  // If it's already OpenAI-style (ElevenLabs, etc.)
   if (Array.isArray(body?.messages)) {
     return {
       mode: "openai",
       messages: body.messages,
-      model: body.model || "openai/gpt-oss-20b",
+      model: body.model || DEFAULT_MODEL,
       stream: body.stream ?? true,
-      extra: body
+      extra: body,
     };
   }
 
-  // Legacy Athina UI style
-  const { message, sessionId = "default" } = body;
-  const history = conversations.get(sessionId) || [];
-
-  const messages = [
-    { role: "system", content: CORE_PROMPT + "\n" + TEXT_MODE_RULES },
-    ...history,
-    { role: "user", content: message || "" }
-  ];
+  const { message = "", sessionId = "default" } = body;
 
   return {
     mode: "athina",
-    messages,
-    model: "openai/gpt-oss-20b",
-    stream: true,
+    messages: [
+      { role: "system", content: CORE_PROMPT + "\n" + TEXT_MODE_RULES },
+      ...getHistory(sessionId),
+      { role: "user", content: message },
+    ],
+    model: DEFAULT_MODEL,
+    stream: body.stream ?? true,
     sessionId,
-    userMessage: message || ""
+    userMessage: message,
   };
 };
 
-// ---------- OpenAI-compatible chat/completions handler ----------
-
 const chatCompletionsHandler = async (req, res) => {
   try {
-    console.log("🔥 /chat HIT", req.body);
-
     const normalized = normalizeChatRequest(req.body);
-    const { messages, model, stream } = normalized;
+    const response = await callOpenRouter({
+      ...normalized.extra,
+      model: normalized.model,
+      messages: normalized.messages,
+      stream: !!normalized.stream,
+      temperature: normalized.extra?.temperature ?? 0.3,
+      max_tokens: normalized.extra?.max_tokens ?? 500,
+    });
 
-    const payload = {
-      model,
-      messages,
-      stream: !!stream,
-      temperature: 0.3,
-      max_tokens: 250
-    };
-
-    const response = await callOpenRouter(payload);
-
-    // STREAMING MODE (for ElevenLabs + any OpenAI client)
-    if (payload.stream) {
-      if (!response.body) {
-        throw new Error("OpenRouter returned no response body.");
-      }
-
+    if (normalized.stream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
@@ -171,212 +390,87 @@ const chatCompletionsHandler = async (req, res) => {
 
       response.body.on("data", (chunk) => {
         const chunkStr = chunk.toString();
-        // Forward raw SSE chunk as-is to client (OpenAI-compatible)
         res.write(chunkStr);
 
-        // Optionally accumulate text for Athina sessions
-        const lines = chunkStr
-          .split("\n")
-          .filter((line) => line.startsWith("data:"));
-
-        for (const line of lines) {
+        for (const line of chunkStr.split("\n")) {
+          if (!line.startsWith("data:")) continue;
           const jsonStr = line.replace("data:", "").trim();
           if (!jsonStr || jsonStr === "[DONE]") continue;
           try {
             const parsed = JSON.parse(jsonStr);
-            const token = parsed.choices?.[0]?.delta?.content || "";
-            if (token) fullText += token;
+            fullText += parsed.choices?.[0]?.delta?.content || parsed.token || "";
           } catch {
-            // ignore parse errors for logging
+            // Ignore partial SSE JSON fragments.
           }
         }
       });
 
       response.body.on("end", () => {
-        // For legacy Athina sessions, store conversation
         if (normalized.mode === "athina") {
-          const { sessionId, userMessage } = normalized;
-          const history = conversations.get(sessionId) || [];
-          conversations.set(sessionId, [
-            ...history,
-            { role: "user", content: userMessage },
-            { role: "assistant", content: fullText }
-          ]);
+          saveTurn(normalized.sessionId, normalized.userMessage, fullText);
         }
-
-        // Ensure proper OpenAI-style termination if not already sent
         res.write("data: [DONE]\n\n");
         res.end();
-        console.log("✅ STREAM COMPLETE");
       });
 
-      response.body.on("error", (err) => {
-        console.error("❌ Stream error:", err.message);
-        if (!res.headersSent) {
-          res.write(
-            `data: ${JSON.stringify({
-              error: "Stream error from OpenRouter"
-            })}\n\n`
-          );
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
+      response.body.on("error", (error) => {
+        console.error("Stream error:", error.message);
+        res.write(`data: ${JSON.stringify({ error: "Stream error from OpenRouter" })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
       });
 
       return;
     }
 
-    // NON-STREAMING MODE (standard OpenAI JSON)
     const data = await response.json();
-
-    // For Athina sessions, store conversation
     if (normalized.mode === "athina") {
-      const { sessionId, userMessage } = normalized;
-      const history = conversations.get(sessionId) || [];
-      const textResponse = data.choices?.[0]?.message?.content || "";
-      conversations.set(sessionId, [
-        ...history,
-        { role: "user", content: userMessage },
-        { role: "assistant", content: textResponse }
-      ]);
+      saveTurn(normalized.sessionId, normalized.userMessage, data.choices?.[0]?.message?.content || "");
     }
-
     res.json(data);
-  } catch (err) {
-    console.error("❌ /chat error:", err.message);
-
-    // If client expects SSE
-    if (!res.headersSent && req.headers.accept === "text/event-stream") {
-      res.setHeader("Content-Type", "text/event-stream");
-      res.write(
-        `data: ${JSON.stringify({
-          error:
-            "Hmm, looks like the system is a bit busy right now. Give me a second and try again 🙂"
-        })}\n\n`
-      );
-      res.write("data: [DONE]\n\n");
-      res.end();
-      return;
-    }
-
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: "Chat processing failed",
-        details: err.message
-      });
-    }
+  } catch (error) {
+    console.error("/api/chat error:", error.message);
+    res.status(500).json({ error: "Chat processing failed", details: error.message });
   }
 };
 
-// OpenAI-compatible routes (for ElevenLabs + others)
 app.post("/v1/chat/completions", chatCompletionsHandler);
 app.post("/chat/completions", chatCompletionsHandler);
-
-// Legacy Athina route
 app.post("/api/chat", chatCompletionsHandler);
-
-// ---------- Voice endpoint (Athina UI + ElevenLabs TTS) ----------
 
 app.post("/api/voice", async (req, res) => {
   try {
-    console.log("🔊 /api/voice HIT");
-
     const { audioBase64, sessionId = "default" } = req.body;
+    if (!audioBase64) return res.status(400).json({ error: "Missing audioBase64" });
 
-    if (!audioBase64) {
-      return res.status(400).json({ error: "Missing audioBase64" });
-    }
-
-    const history = conversations.get(sessionId) || [];
-
-    const userMessage = "[Voice message received]";
-    console.log(`🎤 Processing voice for session: ${sessionId}`);
-
-    const messages = [
-      { role: "system", content: CORE_PROMPT + "\n" + VOICE_MODE_RULES },
-      ...history,
-      { role: "user", content: userMessage }
-    ];
-
-    const payload = {
-      model: "openai/gpt-oss-20b",
-      messages,
+    const response = await callOpenRouter({
+      model: DEFAULT_MODEL,
+      messages: [
+        { role: "system", content: CORE_PROMPT + "\n" + VOICE_MODE_RULES },
+        ...getHistory(sessionId),
+        {
+          role: "user",
+          content:
+            "The user sent a voice message. Speech-to-text is not configured yet, so ask them to repeat the request in text or enable a transcription provider.",
+        },
+      ],
       stream: false,
       temperature: 0.3,
-      max_tokens: 600
-    };
-
-    const response = await callOpenRouter(payload);
-    const data = await response.json();
-
-    if (!data.choices?.[0]?.message?.content) {
-      throw new Error("Invalid OpenRouter response");
-    }
-
-    const textResponse = data.choices[0].message.content;
-
-    conversations.set(sessionId, [
-      ...history,
-      { role: "user", content: userMessage },
-      { role: "assistant", content: textResponse }
-    ]);
-
-    console.log("🔊 Converting response to speech via ElevenLabs...");
-    const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-    const elevenLabsVoiceId =
-      process.env.ELEVENLABS_VOICE_ID || "lxYfHSkYm1EzQzGhdbfc";
-
-    const ttsResponse = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": elevenLabsKey,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          text: textResponse,
-          model_id: "eleven_monolingual_v1",
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75
-          }
-        })
-      }
-    );
-
-    if (!ttsResponse.ok) {
-      const error = await ttsResponse.text();
-      console.error("❌ ElevenLabs error:", error);
-      throw new Error(`ElevenLabs error ${ttsResponse.status}`);
-    }
-
-    const audioBuffer = await ttsResponse.buffer();
-    const audioBase64Response = audioBuffer.toString("base64");
-
-    res.json({
-      success: true,
-      text: textResponse,
-      audioBase64: audioBase64Response,
-      sessionId,
-      timestamp: new Date().toISOString()
+      max_tokens: 300,
     });
 
-    console.log("✅ Voice response complete");
-  } catch (err) {
-    console.error("❌ /api/voice error:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: "Voice processing failed",
-        details: err.message
-      });
-    }
+    const data = await response.json();
+    const textResponse = data.choices?.[0]?.message?.content || "I heard you, but transcription is not configured yet.";
+    saveTurn(sessionId, "[Voice message received]", textResponse);
+
+    const audioBase64Response = await synthesizeSpeech(textResponse);
+    res.json({ success: true, text: textResponse, audioBase64: audioBase64Response, sessionId });
+  } catch (error) {
+    console.error("/api/voice error:", error.message);
+    res.status(500).json({ error: "Voice processing failed", details: error.message });
   }
 });
 
-// ---------- Server start ----------
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`✅ ATHINA backend running on port ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`ATHINA backend running on port ${PORT}`);
+});
